@@ -3974,6 +3974,10 @@ static JSValue JS_ConcatString3(JSContext *ctx, const char *str1,
 
 JSValue JS_NewString(JSContext *ctx, const char *str)
 {
+    if (str == NULL) {
+        return JS_NULL;
+    }
+
     return JS_NewStringLen(ctx, str, strlen(str));
 }
 
@@ -43365,7 +43369,8 @@ static int getTimezoneOffset(int64_t time)
     {
         struct tm tm;
         localtime_r(&ti, &tm);
-        res = -tm.tm_gmtoff / 60;
+        // res = -tm.tm_gmtoff / 60;
+        res = 0;
     }
 #endif
     return res;
