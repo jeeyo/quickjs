@@ -34,7 +34,7 @@
 #include <math.h>
 #if defined(__APPLE__)
 #include <malloc/malloc.h>
-#elif defined(__linux__)
+#elif defined(__linux__) || defined(__GLIBC__)
 #include <malloc.h>
 #elif defined(__FreeBSD__)
 #include <malloc_np.h>
@@ -44,6 +44,7 @@
 #include "list.h"
 #include "quickjs.h"
 #include "libregexp.h"
+#include "libunicode.h"
 #include "libbf.h"
 
 #define OPTIMIZE         1
@@ -1131,7 +1132,7 @@ typedef enum JSStrictEqModeEnum {
 
 static BOOL js_strict_eq2(JSContext *ctx, JSValue op1, JSValue op2,
                           JSStrictEqModeEnum eq_mode);
-static BOOL js_strict_eq(JSContext *ctx, JSValue op1, JSValue op2);
+static BOOL js_strict_eq(JSContext *ctx, JSValueConst op1, JSValueConst op2);
 static BOOL js_same_value(JSContext *ctx, JSValueConst op1, JSValueConst op2);
 static BOOL js_same_value_zero(JSContext *ctx, JSValueConst op1, JSValueConst op2);
 static JSValue JS_ToObject(JSContext *ctx, JSValueConst val);
@@ -1174,9 +1175,10 @@ static JSValue JS_ThrowTypeErrorRevokedProxy(JSContext *ctx);
 static JSValue js_proxy_getPrototypeOf(JSContext *ctx, JSValueConst obj);
 static int js_proxy_setPrototypeOf(JSContext *ctx, JSValueConst obj,
                                    JSValueConst proto_val, BOOL throw_flag);
+
+static int js_resolve_proxy(JSContext *ctx, JSValueConst *pval, int throw_exception);
 static int js_proxy_isExtensible(JSContext *ctx, JSValueConst obj);
 static int js_proxy_preventExtensions(JSContext *ctx, JSValueConst obj);
-static int js_proxy_isArray(JSContext *ctx, JSValueConst obj);
 static int JS_CreateProperty(JSContext *ctx, JSObject *p,
                              JSAtom prop, JSValueConst val,
                              JSValueConst getter, JSValueConst setter,
@@ -1275,7 +1277,6 @@ static JSValue js_module_ns_autoinit(JSContext *ctx, JSObject *p, JSAtom atom,
                                  void *opaque);
 static JSValue JS_InstantiateFunctionListItem2(JSContext *ctx, JSObject *p,
                                                JSAtom atom, void *opaque);
-void JS_SetUncatchableError(JSContext *ctx, JSValueConst val, BOOL flag);
 static JSValue js_object_groupBy(JSContext *ctx, JSValueConst this_val,
                                  int argc, JSValueConst *argv, int is_map);
 
@@ -1680,7 +1681,7 @@ JSRuntime *JS_NewRuntime2(const JSMallocFunctions *mf, void *opaque)
     rt->stack_size = JS_DEFAULT_STACK_SIZE;
     JS_UpdateStackTop(rt);
 
-    rt->current_exception = JS_NULL;
+    rt->current_exception = JS_UNINITIALIZED;
 
     return rt;
  fail:
@@ -1707,7 +1708,7 @@ static size_t js_def_malloc_usable_size(const void *ptr)
     return _msize((void *)ptr);
 #elif defined(EMSCRIPTEN)
     return 0;
-#elif defined(__linux__)
+#elif defined(__linux__) || defined(__GLIBC__)
     return malloc_usable_size((void *)ptr);
 #else
     /* change this to `return 0;` if compilation fails */
@@ -6401,8 +6402,13 @@ JSValue JS_GetException(JSContext *ctx)
     JSValue val;
     JSRuntime *rt = ctx->rt;
     val = rt->current_exception;
-    rt->current_exception = JS_NULL;
+    rt->current_exception = JS_UNINITIALIZED;
     return val;
+}
+
+JS_BOOL JS_HasException(JSContext *ctx)
+{
+    return !JS_IsUninitialized(ctx->rt->current_exception);
 }
 
 static void dbuf_put_leb128(DynBuf *s, uint32_t v)
@@ -12108,15 +12114,14 @@ static __maybe_unused void JS_PrintValue(JSContext *ctx,
 }
 
 /* return -1 if exception (proxy case) or TRUE/FALSE */
+// TODO: should take flags to make proxy resolution and exceptions optional
 int JS_IsArray(JSContext *ctx, JSValueConst val)
 {
-    JSObject *p;
+    if (js_resolve_proxy(ctx, &val, TRUE))
+        return -1;
     if (JS_VALUE_GET_TAG(val) == JS_TAG_OBJECT) {
-        p = JS_VALUE_GET_OBJ(val);
-        if (unlikely(p->class_id == JS_CLASS_PROXY))
-            return js_proxy_isArray(ctx, val);
-        else
-            return p->class_id == JS_CLASS_ARRAY;
+        JSObject *p = JS_VALUE_GET_OBJ(val);
+        return p->class_id == JS_CLASS_ARRAY;
     } else {
         return FALSE;
     }
@@ -14238,7 +14243,7 @@ static no_inline __exception int js_eq_slow(JSContext *ctx, JSValue *sp,
                 goto exception;
             }
         }
-        res = js_strict_eq(ctx, op1, op2);
+        res = js_strict_eq2(ctx, op1, op2, JS_EQ_STRICT);
     } else if (tag1 == JS_TAG_BOOL) {
         op1 = JS_NewInt32(ctx, JS_VALUE_GET_INT(op1));
         goto redo;
@@ -14556,9 +14561,16 @@ static BOOL js_strict_eq2(JSContext *ctx, JSValue op1, JSValue op2,
     return res;
 }
 
-static BOOL js_strict_eq(JSContext *ctx, JSValue op1, JSValue op2)
+static BOOL js_strict_eq(JSContext *ctx, JSValueConst op1, JSValueConst op2)
 {
-    return js_strict_eq2(ctx, op1, op2, JS_EQ_STRICT);
+    return js_strict_eq2(ctx,
+                         JS_DupValue(ctx, op1), JS_DupValue(ctx, op2),
+                         JS_EQ_STRICT);
+}
+
+BOOL JS_StrictEq(JSContext *ctx, JSValueConst op1, JSValueConst op2)
+{
+    return js_strict_eq(ctx, op1, op2);
 }
 
 static BOOL js_same_value(JSContext *ctx, JSValueConst op1, JSValueConst op2)
@@ -14568,6 +14580,11 @@ static BOOL js_same_value(JSContext *ctx, JSValueConst op1, JSValueConst op2)
                          JS_EQ_SAME_VALUE);
 }
 
+BOOL JS_SameValue(JSContext *ctx, JSValueConst op1, JSValueConst op2)
+{
+    return js_same_value(ctx, op1, op2);
+}
+
 static BOOL js_same_value_zero(JSContext *ctx, JSValueConst op1, JSValueConst op2)
 {
     return js_strict_eq2(ctx,
@@ -14575,11 +14592,16 @@ static BOOL js_same_value_zero(JSContext *ctx, JSValueConst op1, JSValueConst op
                          JS_EQ_SAME_VALUE_ZERO);
 }
 
+BOOL JS_SameValueZero(JSContext *ctx, JSValueConst op1, JSValueConst op2)
+{
+    return js_same_value_zero(ctx, op1, op2);
+}
+
 static no_inline int js_strict_eq_slow(JSContext *ctx, JSValue *sp,
                                        BOOL is_neq)
 {
     BOOL res;
-    res = js_strict_eq(ctx, sp[-2], sp[-1]);
+    res = js_strict_eq2(ctx, sp[-2], sp[-1], JS_EQ_STRICT);
     sp[-2] = JS_NewBool(ctx, res ^ is_neq);
     return 0;
 }
@@ -15303,7 +15325,7 @@ static int JS_IteratorClose(JSContext *ctx, JSValueConst enum_obj,
 
     if (is_exception_pending) {
         ex_obj = ctx->rt->current_exception;
-        ctx->rt->current_exception = JS_NULL;
+        ctx->rt->current_exception = JS_UNINITIALIZED;
         res = -1;
     } else {
         ex_obj = JS_UNDEFINED;
@@ -18656,7 +18678,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                     JS_IteratorClose(ctx, sp[-1], TRUE);
                 } else {
                     *sp++ = rt->current_exception;
-                    rt->current_exception = JS_NULL;
+                    rt->current_exception = JS_UNINITIALIZED;
                     pc = b->byte_code_buf + pos;
                     goto restart;
                 }
@@ -21192,8 +21214,7 @@ static JSAtom json_parse_ident(JSParseState *s, const uint8_t **pp, int c)
     for(;;) {
         buf[ident_pos++] = c;
         c = *p;
-        if (c >= 128 ||
-            !((lre_id_continue_table_ascii[c >> 5] >> (c & 31)) & 1))
+        if (c >= 128 || !lre_is_id_continue_byte(c))
             break;
         p++;
         if (unlikely(ident_pos >= ident_size - UTF8_CHAR_LEN_MAX)) {
@@ -21405,9 +21426,29 @@ static __exception int json_next_token(JSParseState *s)
     return -1;
 }
 
-/* only used for ':' and '=>', 'let' or 'function' look-ahead. *pp is
-   only set if TOK_IMPORT is returned */
-/* XXX: handle all unicode cases */
+static int match_identifier(const uint8_t *p, const char *s) {
+    uint32_t c;
+    while (*s) {
+        if ((uint8_t)*s++ != *p++)
+            return 0;
+    }
+    c = *p;
+    if (c >= 128)
+        c = unicode_from_utf8(p, UTF8_CHAR_LEN_MAX, &p);
+    return !lre_js_is_ident_next(c);
+}
+
+/* simple_next_token() is used to check for the next token in simple cases.
+   It is only used for ':' and '=>', 'let' or 'function' look-ahead.
+   (*pp) is only set if TOK_IMPORT is returned for JS_DetectModule()
+   Whitespace and comments are skipped correctly.
+   Then the next token is analyzed, only for specific words.
+   Return values:
+   - '\n' if !no_line_terminator
+   - TOK_ARROW, TOK_IN, TOK_IMPORT, TOK_OF, TOK_EXPORT, TOK_FUNCTION
+   - TOK_IDENT is returned for other identifiers and keywords
+   - otherwise the next character or unicode codepoint is returned.
+ */
 static int simple_next_token(const uint8_t **pp, BOOL no_line_terminator)
 {
     const uint8_t *p;
@@ -21451,33 +21492,42 @@ static int simple_next_token(const uint8_t **pp, BOOL no_line_terminator)
             if (*p == '>')
                 return TOK_ARROW;
             break;
-        default:
-            if (lre_js_is_ident_first(c)) {
-                if (c == 'i') {
-                    if (p[0] == 'n' && !lre_js_is_ident_next(p[1])) {
-                        return TOK_IN;
-                    }
-                    if (p[0] == 'm' && p[1] == 'p' && p[2] == 'o' &&
-                        p[3] == 'r' && p[4] == 't' &&
-                        !lre_js_is_ident_next(p[5])) {
-                        *pp = p + 5;
-                        return TOK_IMPORT;
-                    }
-                } else if (c == 'o' && *p == 'f' && !lre_js_is_ident_next(p[1])) {
-                    return TOK_OF;
-                } else if (c == 'e' &&
-                           p[0] == 'x' && p[1] == 'p' && p[2] == 'o' &&
-                           p[3] == 'r' && p[4] == 't' &&
-                           !lre_js_is_ident_next(p[5])) {
-                    *pp = p + 5;
-                    return TOK_EXPORT;
-                } else if (c == 'f' && p[0] == 'u' && p[1] == 'n' &&
-                         p[2] == 'c' && p[3] == 't' && p[4] == 'i' &&
-                         p[5] == 'o' && p[6] == 'n' && !lre_js_is_ident_next(p[7])) {
-                    return TOK_FUNCTION;
-                }
-                return TOK_IDENT;
+        case 'i':
+            if (match_identifier(p, "n"))
+                return TOK_IN;
+            if (match_identifier(p, "mport")) {
+                *pp = p + 5;
+                return TOK_IMPORT;
             }
+            return TOK_IDENT;
+        case 'o':
+            if (match_identifier(p, "f"))
+                return TOK_OF;
+            return TOK_IDENT;
+        case 'e':
+            if (match_identifier(p, "xport"))
+                return TOK_EXPORT;
+            return TOK_IDENT;
+        case 'f':
+            if (match_identifier(p, "unction"))
+                return TOK_FUNCTION;
+            return TOK_IDENT;
+        case '\\':
+            if (*p == 'u') {
+                if (lre_js_is_ident_first(lre_parse_escape(&p, TRUE)))
+                    return TOK_IDENT;
+            }
+            break;
+        default:
+            if (c >= 128) {
+                c = unicode_from_utf8(p - 1, UTF8_CHAR_LEN_MAX, &p);
+                if (no_line_terminator && (c == CP_PS || c == CP_LS))
+                    return '\n';
+            }
+            if (lre_is_space(c))
+                continue;
+            if (lre_js_is_ident_first(c))
+                return TOK_IDENT;
             break;
         }
         return c;
@@ -22355,7 +22405,8 @@ static int __exception js_parse_property_name(JSParseState *s,
             if (next_token(s))
                 goto fail1;
             if (s->token.val == ':' || s->token.val == ',' ||
-                s->token.val == '}' || s->token.val == '(') {
+                s->token.val == '}' || s->token.val == '(' ||
+                s->token.val == '=') {
                 is_non_reserved_ident = TRUE;
                 goto ident_found;
             }
@@ -22371,7 +22422,8 @@ static int __exception js_parse_property_name(JSParseState *s,
             if (next_token(s))
                 goto fail1;
             if (s->token.val == ':' || s->token.val == ',' ||
-                s->token.val == '}' || s->token.val == '(') {
+                s->token.val == '}' || s->token.val == '(' ||
+                s->token.val == '=') {
                 is_non_reserved_ident = TRUE;
                 goto ident_found;
             }
@@ -23055,7 +23107,12 @@ static __exception int js_parse_class(JSParseState *s, BOOL is_class_expr,
                 goto fail;
             continue;
         }
-        is_static = (s->token.val == TOK_STATIC);
+        is_static = FALSE;
+        if (s->token.val == TOK_STATIC) {
+            int next = peek_token(s, TRUE);
+            if (!(next == ';' || next == '}' || next == '(' || next == '='))
+                is_static = TRUE;
+        }
         prop_type = -1;
         if (is_static) {
             if (next_token(s))
@@ -26215,7 +26272,6 @@ static int is_let(JSParseState *s, int decl_mask)
     int res = FALSE;
 
     if (token_is_pseudo_keyword(s, JS_ATOM_let)) {
-#if 1
         JSParsePos pos;
         js_parse_get_pos(s, &pos);
         for (;;) {
@@ -26248,12 +26304,6 @@ static int is_let(JSParseState *s, int decl_mask)
         if (js_parse_seek_token(s, &pos)) {
             res = -1;
         }
-#else
-        int tok = peek_token(s, TRUE);
-        if (tok == '{' || tok == TOK_IDENT || peek_token(s, FALSE) == '[') {
-            res = TRUE;
-        }
-#endif
     }
     return res;
 }
@@ -46106,8 +46156,10 @@ static JSValue js_proxy_get(JSContext *ctx, JSValueConst obj, JSAtom atom,
     if (JS_IsException(ret))
         return JS_EXCEPTION;
     res = JS_GetOwnPropertyInternal(ctx, &desc, JS_VALUE_GET_OBJ(s->target), atom);
-    if (res < 0)
+    if (res < 0) {
+        JS_FreeValue(ctx, ret);
         return JS_EXCEPTION;
+    }
     if (res) {
         if ((desc.flags & (JS_PROP_GETSET | JS_PROP_CONFIGURABLE | JS_PROP_WRITABLE)) == 0) {
             if (!js_same_value(ctx, desc.value, ret)) {
@@ -46668,20 +46720,35 @@ static JSValue js_proxy_call(JSContext *ctx, JSValueConst func_obj,
     return ret;
 }
 
-static int js_proxy_isArray(JSContext *ctx, JSValueConst obj)
-{
-    JSProxyData *s = JS_GetOpaque(obj, JS_CLASS_PROXY);
-    if (!s)
-        return FALSE;
-    if (js_check_stack_overflow(ctx->rt, 0)) {
-        JS_ThrowStackOverflow(ctx);
-        return -1;
+/* `js_resolve_proxy`: resolve the proxy chain
+   `*pval` is updated with to ultimate proxy target
+   `throw_exception` controls whether exceptions are thown or not
+   - return -1 in case of error
+   - otherwise return 0
+ */
+static int js_resolve_proxy(JSContext *ctx, JSValueConst *pval, BOOL throw_exception) {
+    int depth = 0;
+    JSObject *p;
+    JSProxyData *s;
+
+    while (JS_VALUE_GET_TAG(*pval) == JS_TAG_OBJECT) {
+        p = JS_VALUE_GET_OBJ(*pval);
+        if (p->class_id != JS_CLASS_PROXY)
+            break;
+        if (depth++ > 1000) {
+            if (throw_exception)
+                JS_ThrowStackOverflow(ctx);
+            return -1;
+        }
+        s = p->u.opaque;
+        if (s->is_revoked) {
+            if (throw_exception)
+                JS_ThrowTypeErrorRevokedProxy(ctx);
+            return -1;
+        }
+        *pval = s->target;
     }
-    if (s->is_revoked) {
-        JS_ThrowTypeErrorRevokedProxy(ctx);
-        return -1;
-    }
-    return JS_IsArray(ctx, s->target);
+    return 0;
 }
 
 static const JSClassExoticMethods js_proxy_exotic_methods = {
@@ -53367,6 +53434,16 @@ static JSValue js_typed_array_get_byteOffset(JSContext *ctx,
     }
     ta = p->u.typed_array;
     return JS_NewInt32(ctx, ta->offset);
+}
+
+JSValue JS_NewTypedArray(JSContext *ctx, int argc, JSValueConst *argv,
+                         JSTypedArrayEnum type)
+{
+    if (type < JS_TYPED_ARRAY_UINT8C || type > JS_TYPED_ARRAY_FLOAT64)
+        return JS_ThrowRangeError(ctx, "invalid typed array type");
+
+    return js_typed_array_constructor(ctx, JS_UNDEFINED, argc, argv,
+                                      JS_CLASS_UINT8C_ARRAY + type);
 }
 
 /* Return the buffer associated to the typed array or an exception if
